@@ -7,19 +7,19 @@ import torch
 import torch.nn.functional as F
 
 from .kalman_filter import KalmanFilter
-from yolox.tracker import matching
+from . import matching
 from .basetrack import BaseTrack, TrackState
 
 class STrack(BaseTrack):
     shared_kalman = KalmanFilter()
-    def __init__(self, tlwh, score):
+    def __init__(self, tlwh, score, class_id):
 
         # wait activate
         self._tlwh = np.asarray(tlwh, dtype=float)
         self.kalman_filter = None
         self.mean, self.covariance = None, None
         self.is_activated = False
-
+        self.class_id = class_id
         self.score = score
         self.tracklet_len = 0
 
@@ -42,7 +42,7 @@ class STrack(BaseTrack):
                 stracks[i].mean = mean
                 stracks[i].covariance = cov
 
-    def activate(self, kalman_filter, frame_id):
+    def activate(self, kalman_filter, frame_id, temporal_filter):
         """Start a new tracklet"""
         self.kalman_filter = kalman_filter
         self.track_id = self.next_id()
@@ -50,9 +50,11 @@ class STrack(BaseTrack):
 
         self.tracklet_len = 0
         self.state = TrackState.Tracked
-        if frame_id == 1:
+        if temporal_filter:
+            if frame_id == 1:
+                self.is_activated = True
+        else:
             self.is_activated = True
-        # self.is_activated = True
         self.frame_id = frame_id
         self.start_frame = frame_id
 
@@ -148,10 +150,11 @@ class BYTETracker(object):
         self.lost_stracks = []  # type: list[STrack]
         self.removed_stracks = []  # type: list[STrack]
 
+        self._keep_temporal = args.temporal_fix
         self.frame_id = 0
         self.args = args
-        #self.det_thresh = args.track_thresh
-        self.det_thresh = args.track_thresh + 0.1
+        self.det_thresh = args.track_thresh
+        #self.det_thresh = args.track_thresh + 0.1
         self.buffer_size = int(frame_rate / 30.0 * args.track_buffer)
         self.max_time_lost = self.buffer_size
         self.kalman_filter = KalmanFilter()
@@ -163,11 +166,13 @@ class BYTETracker(object):
         lost_stracks = []
         removed_stracks = []
 
-        if output_results.shape[1] == 5:
+        if output_results.shape[1] == 6:
+            classes = output_results[:, 5]
             scores = output_results[:, 4]
             bboxes = output_results[:, :4]
         else:
             output_results = output_results.cpu().numpy()
+            classes = np.zeros(output_results.shape[0])
             scores = output_results[:, 4] * output_results[:, 5]
             bboxes = output_results[:, :4]  # x1y1x2y2
         img_h, img_w = img_info[0], img_info[1]
@@ -183,11 +188,13 @@ class BYTETracker(object):
         dets = bboxes[remain_inds]
         scores_keep = scores[remain_inds]
         scores_second = scores[inds_second]
+        class_keep = classes[remain_inds]
+        class_second = classes[inds_second]
 
         if len(dets) > 0:
             '''Detections'''
-            detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
-                          (tlbr, s) in zip(dets, scores_keep)]
+            detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, c) for
+                          (tlbr, s, c) in zip(dets, scores_keep, class_keep)]
         else:
             detections = []
 
@@ -223,8 +230,8 @@ class BYTETracker(object):
         # association the untrack to the low score detections
         if len(dets_second) > 0:
             '''Detections'''
-            detections_second = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
-                          (tlbr, s) in zip(dets_second, scores_second)]
+            detections_second = [STrack(STrack.tlbr_to_tlwh(tlbr), s, c_s) for
+                          (tlbr, s, c_s) in zip(dets_second, scores_second, class_second)]
         else:
             detections_second = []
         r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
@@ -265,7 +272,7 @@ class BYTETracker(object):
             track = detections[inew]
             if track.score < self.det_thresh:
                 continue
-            track.activate(self.kalman_filter, self.frame_id)
+            track.activate(self.kalman_filter, self.frame_id, self._keep_temporal)
             activated_starcks.append(track)
         """ Step 5: Update state"""
         for track in self.lost_stracks:
